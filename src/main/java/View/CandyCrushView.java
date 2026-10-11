@@ -59,6 +59,14 @@ public class CandyCrushView extends JFrame {
 
 
 // =========================================================
+// INTERFACE ĐỂ GIAO TIẾP VỚI CONTROLLER
+// =========================================================
+interface BoardInteractionListener {
+    // Hàm này sẽ được Controller lắng nghe
+    void onSwapRequested(int r1, int c1, int r2, int c2);
+}
+
+// =========================================================
 // CLASS BOARDPANEL - NƠI XỬ LÝ VẼ VÀ ANIMATION 
 // =========================================================
 class BoardPanel extends JPanel {
@@ -74,6 +82,9 @@ class BoardPanel extends JPanel {
     private int selectedRow = -1;
     private int selectedCol = -1;
 
+    // --- BIẾN KẾT NỐI CONTROLLER ---
+    private BoardInteractionListener listener;
+
     // --- BIẾN ANIMATION ---
     private boolean isAnimating = false;
     private Timer timer;
@@ -87,17 +98,11 @@ class BoardPanel extends JPanel {
     private int currentExplosionSize; 
     private List<Point> explodingCandies = new ArrayList<>();
 
-    // --- BIẾN ANIMATION RƠI KẸO ---
     private boolean isDropping = false;
     private Timer dropTimer;
     private List<FallingCandy> fallingCandies = new ArrayList<>();
-    // Hàm API để Controller cập nhật dữ liệu mới từ Model sang View
-    public void updateBoard(int[][] newBoard) {
-        this.board = newBoard;
-        repaint();
-    }
 
-    // Lớp phụ trợ lưu thông tin từng viên kẹo đang rơi
+    // Lớp phụ trợ lưu thông tin kẹo rơi
     class FallingCandy {
         int type, col, endRow;
         float currentY, targetY;
@@ -106,7 +111,6 @@ class BoardPanel extends JPanel {
             this.type = type;
             this.col = col;
             this.endRow = endRow;
-            // Tính toán pixel: Bắt đầu từ startRow và rơi tới endRow
             this.currentY = PADDING + (startRow * TILE_SIZE);
             this.targetY = PADDING + (endRow * TILE_SIZE);
         }
@@ -124,6 +128,17 @@ class BoardPanel extends JPanel {
         setupMouseListener();
     }
 
+    // Hàm để Controller đăng ký lắng nghe sự kiện
+    public void setInteractionListener(BoardInteractionListener listener) {
+        this.listener = listener;
+    }
+
+    // Hàm API để Controller cập nhật dữ liệu mới từ Model
+    public void updateBoard(int[][] newBoard) {
+        this.board = newBoard;
+        repaint();
+    }
+
     private void initMockBoard() {
         board = new int[ROWS][COLS];
         for (int r = 0; r < ROWS; r++) {
@@ -137,7 +152,6 @@ class BoardPanel extends JPanel {
         addMouseListener(new MouseAdapter() {
             @Override
             public void mousePressed(MouseEvent e) {
-                // Khóa input nếu đang chạy bất kỳ hiệu ứng nào
                 if (isAnimating || isExploding || isDropping) return;
 
                 int c = (e.getX() - PADDING) / TILE_SIZE;
@@ -150,7 +164,15 @@ class BoardPanel extends JPanel {
                         repaint();
                     } else {
                         boolean isAdjacent = (Math.abs(selectedRow - r) + Math.abs(selectedCol - c) == 1);
-                        if (isAdjacent) startSwapAnimation(selectedRow, selectedCol, r, c);
+                        if (isAdjacent) {
+                            // THAY ĐỔI: Không tự chạy Animation nữa, mà BÁO CHO CONTROLLER
+                            if (listener != null) {
+                                listener.onSwapRequested(selectedRow, selectedCol, r, c);
+                            } else {
+                                // Nếu chưa có Controller (đang test View), tự chạy tạm
+                                startSwapAnimation(selectedRow, selectedCol, r, c, null);
+                            }
+                        }
                         selectedRow = -1;
                         selectedCol = -1;
                         repaint();
@@ -160,7 +182,8 @@ class BoardPanel extends JPanel {
         });
     }
 
-    public void startSwapAnimation(int row1, int col1, int row2, int col2) {
+    // THAY ĐỔI: Thêm tham số Runnable onComplete cho tất cả các hàm Animation
+    public void startSwapAnimation(int row1, int col1, int row2, int col2, Runnable onComplete) {
         isAnimating = true;
         r1 = row1; c1 = col1;
         r2 = row2; c2 = col2;
@@ -174,17 +197,25 @@ class BoardPanel extends JPanel {
                 timer.stop();
                 isAnimating = false;
                 animProgress = 0;
+                
+                // Cập nhật mảng trên View (Controller cũng sẽ cập nhật trên Model)
                 int temp = board[r1][c1];
                 board[r1][c1] = board[r2][c2];
                 board[r2][c2] = temp;
+                
+                // Gọi ngược lại Controller báo là đã trượt xong
+                if (onComplete != null) onComplete.run();
             }
             repaint();
         });
         timer.start();
     }
 
-    public void startExplosionAnimation(List<Point> candies) {
-        if (candies == null || candies.isEmpty() || isExploding || isAnimating || isDropping) return;
+    public void startExplosionAnimation(List<Point> candies, Runnable onComplete) {
+        if (candies == null || candies.isEmpty() || isExploding || isAnimating || isDropping) {
+            if (onComplete != null) onComplete.run();
+            return;
+        }
         
         this.explodingCandies = candies;
         this.isExploding = true;
@@ -197,51 +228,51 @@ class BoardPanel extends JPanel {
                 isExploding = false;
                 for (Point p : explodingCandies) board[p.x][p.y] = -1; 
                 explodingCandies.clear();
+                
+                // Báo cho Controller: Đã nổ xong!
+                if (onComplete != null) onComplete.run();
             }
             repaint();
         });
         explosionTimer.start();
     }
 
-    // --- HÀM API HIỆU ỨNG RƠI KẸO ---
-    public void startDropAnimation() {
+    public void startDropAnimation(Runnable onComplete) {
         if (isAnimating || isExploding || isDropping) return;
         fallingCandies.clear();
 
-        // 1. Quét tìm khoảng trống và tính toán tọa độ kẹo rơi
         for (int c = 0; c < COLS; c++) {
             int emptySpaces = 0;
-            // Duyệt từ đáy lên đỉnh
             for (int r = ROWS - 1; r >= 0; r--) {
                 if (board[r][c] == -1) {
-                    emptySpaces++; // Đếm số ô trống
+                    emptySpaces++; 
                 } else if (emptySpaces > 0) {
-                    // Nếu có kẹo và bên dưới có ô trống -> Viên kẹo này phải rơi
                     fallingCandies.add(new FallingCandy(board[r][c], c, r, r + emptySpaces));
-                    board[r + emptySpaces][c] = board[r][c]; // Cập nhật sẵn mảng đích
+                    board[r + emptySpaces][c] = board[r][c]; 
                     board[r][c] = -1; 
                 }
             }
-            // Sinh kẹo mới bù vào số lượng ô trống
             for (int i = 0; i < emptySpaces; i++) {
-                int newType = (int) (Math.random() * 6);
-                // Tạo hiệu ứng rơi từ trên mép bảng (startRow là số âm)
+                int newType = (int) (Math.random() * 6); 
                 fallingCandies.add(new FallingCandy(newType, c, -emptySpaces + i, i));
                 board[i][c] = newType;
             }
         }
 
-        if (fallingCandies.isEmpty()) return;
+        if (fallingCandies.isEmpty()) {
+            if (onComplete != null) onComplete.run();
+            return;
+        }
+        
         isDropping = true;
 
-        // 2. Chạy Animation tăng dần trục Y
         dropTimer = new Timer(15, e -> {
             boolean allDone = true;
             for (FallingCandy fc : fallingCandies) {
                 if (fc.currentY < fc.targetY) {
-                    fc.currentY += 8; // Tốc độ rơi: 8 pixel mỗi frame
+                    fc.currentY += 8; 
                     if (fc.currentY > fc.targetY) fc.currentY = fc.targetY;
-                    allDone = false; // Vẫn còn kẹo chưa rơi tới đích
+                    allDone = false; 
                 }
             }
 
@@ -249,19 +280,24 @@ class BoardPanel extends JPanel {
                 dropTimer.stop();
                 isDropping = false;
                 fallingCandies.clear();
+                
+                // Báo cho Controller: Kẹo đã rơi xong, kiểm tra xem có chuỗi 3 mới không!
+                if (onComplete != null) onComplete.run();
             }
             repaint();
         });
         dropTimer.start();
     }
 
+    // ==========================================
+    // PHẦN VẼ (paintComponent và drawCandy) 
+    // ==========================================
     @Override
     protected void paintComponent(Graphics g) {
         super.paintComponent(g);
         Graphics2D g2d = (Graphics2D) g;
         g2d.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
 
-        // Vẽ toàn bộ bảng kẹo tĩnh
         for (int r = 0; r < ROWS; r++) {
             for (int c = 0; c < COLS; c++) {
                 int x = PADDING + (c * TILE_SIZE);
@@ -274,7 +310,6 @@ class BoardPanel extends JPanel {
 
                 if (isAnimating && ((r == r1 && c == c1) || (r == r2 && c == c2))) continue; 
                 
-                // Nếu đang rơi, KHÔNG VẼ kẹo tĩnh ở những ô đích (để tránh bị đè hình)
                 boolean isFallingTarget = false;
                 if (isDropping) {
                     for (FallingCandy fc : fallingCandies) {
@@ -296,7 +331,6 @@ class BoardPanel extends JPanel {
             }
         }
 
-        // Vẽ 2 viên đang trượt ngang dọc
         if (isAnimating) {
             int baseX1 = PADDING + (c1 * TILE_SIZE);
             int baseY1 = PADDING + (r1 * TILE_SIZE);
@@ -312,9 +346,7 @@ class BoardPanel extends JPanel {
             drawCandy(g2d, board[r2][c2], currentX2, currentY2, false);
         }
 
-        // Vẽ danh sách các viên kẹo đang rơi
         if (isDropping) {
-            // Dùng tính năng Cắt Xén (Clip) để giấu đi phần kẹo mới đang lơ lửng ngoài viền bảng
             Shape oldClip = g2d.getClip();
             g2d.clipRect(PADDING, PADDING, COLS * TILE_SIZE, ROWS * TILE_SIZE);
 
@@ -322,7 +354,6 @@ class BoardPanel extends JPanel {
                 int drawX = PADDING + (fc.col * TILE_SIZE);
                 drawCandy(g2d, fc.type, drawX, (int) fc.currentY, false);
             }
-            // Khôi phục lại viền vẽ mặc định
             g2d.setClip(oldClip);
         }
     }
